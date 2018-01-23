@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from pathlib import Path
 import requests
 import http.cookiejar as cookielib
