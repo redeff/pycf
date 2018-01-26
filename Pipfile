@@ -17,3 +17,6 @@ python_version = "3.5"
 [packages]
 
 aiohttp = "*"
+"bs4" = "*"
+colorama = "*"
+libtmux = "*"

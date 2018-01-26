@@ -1,8 +1,10 @@
+#!/usr/bin/env pipenv run python
 from pathlib import Path
-import requests
+# import requests
 import http.cookiejar as cookielib
 from bs4 import BeautifulSoup
 import asyncio
+import aiohttp
 import argparse
 import re
 import os
@@ -10,29 +12,34 @@ import copy
 import concurrent.futures
 import datetime
 import time
+import libtmux
 from colorama import init, Fore, Back, Style
 init()
 
 
 cf_page = 'http://codeforces.com'
 config_dir = os.path.expanduser('~/proj/pycf/dep')
-# work_dir = os.path.expanduser('~/cmp/cf')
-work_dir = os.path.expanduser('~/proj/pycf/test')
+work_dir = os.path.expanduser('~/cmp/cf')
+# work_dir = os.path.expanduser('~/proj/pycf/test')
 html_wrap_template = config_dir + '/html_wrap_template.html'
 
+# Codeforces Session
 class Session:
-    def __init__(self, cookiefile = None):
-        self.session = requests.Session()
-        if cookiefile != None:
-            self.transient = False
-            self.session.cookies = cookielib.LWPCookieJar(cookiefile)
-            try:
-                self.session.cookies.load()
-            except:
-                pass
-        else:
-            self.transient = True
+    def __init__(self):
+        self.session = aiohttp.ClientSession()
 
+    async def __aenter__(self):
+        await self.session.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.session.__aexit__(exc_type, exc, tb)
+
+    def save(self, cookiefile):
+        self.session.cookie_jar.save(cookiefile)
+
+    def load(self, cookiefile):
+        self.session.cookie_jar.load(cookiefile)
 
     # Given the downloaded source of a page, extract the csrf (cross-site request forgery)
     # protection token to authenticate many requests
@@ -53,20 +60,20 @@ class Session:
 
     # returns session object for further authenticated requests
     # provide codeforces username & password
-    def login(self, user, passwd):
-        csrf = self.csrf_from_page(BeautifulSoup(self.session.get(cf_page).content, 'html.parser'))
-        response = self.session.post(url=cf_page + "/enter", data={
-            "action": "enter", 
-            "handle": "plugin_test", 
-            "password": "throwaway", 
-            "remember": "true", 
-            "csrf_token": csrf
-        })
-        if response.status_code != 200:
-            raise Exception("Login unsuccessful. Check provided username and password")
-        if not self.transient:
-            self.session.cookies.save()
+    async def login(self, user, passwd):
+        async with self.session.get(cf_page) as csrf_page:
+            csrf = self.csrf_from_page(BeautifulSoup(await csrf_page.read(), 'html.parser'))
 
+            payload = {
+                "action": "enter", 
+                "handle": "plugin_test", 
+                "password": "throwaway", 
+                "remember": "true", 
+                "csrf_token": csrf
+            }
+            async with self.session.post(url=cf_page + "/enter", data=payload) as response:
+                if response.status != 200:
+                    raise Exception("Login unsuccessful. Check provided username and password")
 
     # submit a problem to codeforces under a login session
     # filename = path to the source file you want to submit
@@ -75,72 +82,92 @@ class Session:
     # lang = optional programming language of submission, if blank it'll be
     #   inferred using the extension
     # session = login session obtaines by a call to login()
-    def submit(self, filename, problem, lang = None):
+    async def submit(self, filename, problem, lang = None):
         if lang == None:
             lang = self.infer_from_extension(os.path.splitext(filename)[1])
         submit_url = cf_page + '/contest/' + problem.contest + '/submit'
-        csrf = self.csrf_from_page(BeautifulSoup(self.session.get(submit_url).content, 'html.parser'))
-        response = self.session.post(url=submit_url, data={
-            'csrf_token': csrf,
-            'action': 'submitSolutionFormSubmitted',
-            'submittedProblemIndex': problem.problem,
-            'programTypeId': lang,
-        }, files={
-            'source': open(filename, 'rb')
-        })
-        if response.status_code != 200:
-            raise Exception("Submission failed")
-        if not self.transient:
-            self.session.cookies.save()
+        async with self.session.get(submit_url) as csrf_page:
+            csrf = self.csrf_from_page(BeautifulSoup(await csrf_page.read(), 'html.parser'))
 
+            payload = {
+                'csrf_token': csrf,
+                'action': 'submitSolutionFormSubmitted',
+                'submittedProblemIndex': problem.problem,
+                'programTypeId': str(lang),
+                'source': open(filename, 'rb')
+            }
+
+            async with self.session.post(url=submit_url, data=payload) as response:
+                if response.status != 200:
+                    raise Exception("Submission failed")
+
+# dumb_session = aiohttp.ClientSession()
+
+# Problem download dependency graph
+# ALL < statement, test_cases
+# STATEMENT < statement_text, statement_images
+# STATEMENT_TEXT < @problem_page
+# STATEMENT_IMAGES < @image_page < image_url < @problem_page
 class Problem:
-    def __init__(self, contest, problem):
+
+    wrap_template = BeautifulSoup(open(html_wrap_template, 'r').read(), 'html.parser') 
+
+    def __init__(self, contest, problem, session = None):
+        self.session = session
         self.contest = contest
         self.problem = problem
+        self.raw_statement = None
+        self.images = [] # From expected filename to bytestring of the actual image
+        self.image_urls = []
+        self.wrapped_statement = None
+        self.in_test_cases = None
+        self.out_test_cases = None
 
-        self.page_soup = None
-        self.statement = None
-        self.images = {} 
-        self.test_cases = None
+    async def get_raw_statement_and_image_urls(self):
+        if self.raw_statement != None:
+            return self.raw_statement, self.image_urls
 
-    def get_statement(self):
-        if self.page_soup == None:
-            self.download_page()
+        async with self.session.get(cf_page + '/contest/' + self.contest + '/problem/' + self.problem) as page:
+            page = BeautifulSoup(await page.read(), 'html.parser')
+            self.raw_statement = page.find(class_='problem-statement')
 
-        # if self.statement != None:
-        #     return self.statement
+            counter = 0
+            for img in self.raw_statement.find_all('img'):
+                new_url = str(counter) + '.png'
+                self.image_urls.append((new_url, img['src']))
+                img['src'] = new_url
+                counter += 1
 
-        unwrapped_statement = self.page_soup.find(attrs={'class': 'problem-statement'})
+            return self.raw_statement, self.image_urls
+
+    async def get_raw_statement(self):
+        return (await self.get_raw_statement_and_image_urls())[0]
+
+    async def get_image_urls(self):
+        return (await self.get_raw_statement_and_image_urls())[1]
+
+    async def get_wrapped_statement(self):
+        if self.wrapped_statement != None:
+            return self.wrapped_statement
+
         my_wrapper = copy.copy(self.wrap_template)
+        my_wrapper.find(class_='template-replace').replace_with(copy.copy(await self.get_raw_statement()))
+        self.wrapped_statement = my_wrapper.prettify()
+        return self.wrapped_statement 
 
-        try:
-            my_wrapper.find(class_='template-replace').replace_with(copy.copy(unwrapped_statement))
-        except:
-            print(wrap_template.prettify())
-
-
-        counter = 0
-        for img in my_wrapper.find_all('img'):
-            new_url = str(counter) + '.png'
-            self.images[new_url] = img['src']
-            img['src'] = new_url 
-            counter += 1
-
-        return my_wrapper
-
-    def get_images(self):
-        if self.images != None:
-            return self.images 
-
-        self.get_statement()
+    async def get_images(self):
+        async def do_task(p):
+            # print('getting image ' + p[1])
+            async with self.session.get(cf_page + '/' + p[1]) as page:
+                res = p[0], await page.read()
+                # print('ready image' + p[1])
+                return res
+        self.images = await asyncio.gather(*map(do_task, self.image_urls))
         return self.images
 
-    def get_test_cases(self):
-        if self.page_soup == None:
-            self.download_page()
-
+    async def get_testcases(self):
         test_inputs = []
-        for inp in self.page_soup.find_all('div', class_='input'):
+        for inp in (await self.get_raw_statement()).find_all('div', class_='input'):
             inp = inp.find('pre')
             for br in inp.find_all('br'):
                 br.replace_with('\n')
@@ -148,77 +175,81 @@ class Problem:
             test_inputs.append(inp.text)
 
         test_outputs = []
-        for out in self.page_soup.find_all('div', class_='output'):
+        for out in (await self.get_raw_statement()).find_all('div', class_='output'):
             out = out.find('pre')
             for br in inp.find_all('br'):
                 br.replace_with('\n')
 
             test_outputs.append(out.text)
 
+        self.in_test_cases = test_inputs
+        self.out_test_cases = test_outputs
+
         return (test_inputs, test_outputs)
 
-    def download_page(self):
-        page = requests.get(cf_page + '/contest/' + self.contest + '/problem/' + self.problem)
-        self.page_soup = BeautifulSoup(page.content, 'html.parser')
+    async def download(self):
+        await self.get_wrapped_statement()
+        await self.get_images()
+        await self.get_testcases()
+        return self
 
-    async def download_images(self):
-        loop = asyncio.get_event_loop()
-        futures = [
-                loop.run_in_executor(
-                    None,
-                    requests.get,
-                    cf_page + '/' + url
-                )
-                for p, url in self.get_images().items()
-        ]
-        total = [] 
-        for response in await asyncio.gather(*futures):
-            total.append(response.content)
-
-        return total
-
-    def save(self):
-        path_to_prob = '%s/%s/%s/' % (work_dir, self.contest, self.problem)
+    def save(self, to_dir=work_dir):
+        path_to_prob = '%s/%s/%s/' % (to_dir, self.contest, self.problem)
         Path(path_to_prob).mkdir(parents=True, exist_ok=True)
         Path(path_to_prob + 'statement/').mkdir(exist_ok=True)
-        open(path_to_prob + 'statement/index.html', 'w').write(self.get_statement().prettify())
+        open(path_to_prob + 'statement/index.html', 'w').write(self.wrapped_statement)
 
-        loop = asyncio.get_event_loop()
-        images = loop.run_until_complete(self.download_images())
-        
-        # for (path, url) in self.get_images().items():
-        #    open(path_to_prob + 'statement/' + path, 'wb').write(requests.get(cf_page + '/' + url).content)
-        for (idx, path) in enumerate(self.get_images()):
-           open(path_to_prob + 'statement/' + path, 'wb').write(images[idx])
+        for path, img in self.images:
+           open(path_to_prob + 'statement/' + path, 'wb').write(img)
 
-        (test_inp, test_out) = self.get_test_cases()
-        for idx, inp in enumerate(test_inp):
+        for idx, inp in enumerate(self.in_test_cases):
             open(path_to_prob + str(idx) + '.in', 'w').write(inp)
 
-        for idx, out in enumerate(test_out):
+        for idx, out in enumerate(self.out_test_cases):
             open(path_to_prob + str(idx) + '.out', 'w').write(out)
 
 
-Problem.wrap_template = BeautifulSoup(open(html_wrap_template, 'r').read(), 'html.parser') 
-
 class Contest:
-    def __init__(self, contest):
+    def __init__(self, contest, session):
         self.contest = contest
-        self.page_soup = None
+        self.page = None
+        self.problems = None 
+        self.session = session
 
-    def download_page(self):
-        page = requests.get(cf_page + '/contest/' + self.contest)
-        self.page_soup = BeautifulSoup(page.content, 'html.parser')
+    async def download_page(self):
+        async with self.session.get(cf_page + '/contest/' + self.contest) as page:
+            self.page = BeautifulSoup(await page.text(), 'html.parser')
 
-    def get_problems(self):
-        if self.page_soup == None:
-            self.download_page()
+    async def download(self):
+        await asyncio.gather(*map(lambda x: x.download(), await self.get_problem_names()))
+        return self
 
-        for problem in self.page_soup.find_all('td', class_='id'):
-            yield problem.find('a').text.strip()
+    async def get_problem_names(self):
+        if self.page == None:
+            await self.download_page()
+
+        if self.problems != None:
+            return self.problems
+
+        self.problems = []
+
+        for problem in self.page.find_all('td', class_='id'):
+            self.problems.append(Problem(self.contest, problem.find('a').text.strip(), self.session))
+
+        return self.problems
 
     def save(self):
-        for p in problems
+        for p in self.problems:
+            p.save()
+
+# async def call():
+#     async with aiohttp.ClientSession() as s:
+#         # await s.login("plugin_test", "throwaway")
+#         # await s.submit("main.cpp", Problem("722", "B"))
+#         (await Contest('741', s).download()).save()
+# 
+# loop = asyncio.get_event_loop()
+# loop.run_until_complete(call())
 
 class Info:
     @classmethod
@@ -229,8 +260,8 @@ class Info:
         name = contest["name"]
         yd = contest["id"]
         if colored:
-            return Style.BRIGHT + Fore.MAGENTA + str(yd) + Style.RESET_ALL + ' : ' +\
-                Fore.CYAN + name + Style.RESET_ALL + '\n ' +\
+            return '\033[31m' + str(yd) + Style.RESET_ALL + ' : ' +\
+                '\033[91m' + name + Style.RESET_ALL + '\n ' +\
                 Fore.BLUE + 'in ' + str(rel_time) +\
                 Fore.GREEN + ' at ' + time.strftime('%Y-%m-%d %H:%M:%S', datetime.datetime.fromtimestamp(ini_time).timetuple()) +\
                 Fore.YELLOW + ' lasts ' + str(dur)
@@ -242,13 +273,15 @@ class Info:
                 ' lasts ' + str(dur)
 
     @classmethod
-    def get_upcoming_contests(cls, colored=True):
+    async def get_upcoming_contests(cls, session, colored=True):
         total = ''
-        contests = requests.get(cf_page + '/api/contest.list').json()["result"];
-        for contest in contests:
-            if contest["phase"] != 'FINISHED':
-                total += cls.str_single_contest(contest, colored) + '\n'
-        return total[:-1]
+        async with session.get(cf_page + '/api/contest.list') as contests:
+            contests = await contests.json()
+            contests = contests['result']
+            for contest in contests:
+                if contest["phase"] != 'FINISHED':
+                    total += cls.str_single_contest(contest, colored) + '\n'
+            return total[:-1]
 
 class Infer:
     @classmethod
@@ -258,51 +291,63 @@ class Infer:
 
         path, last = os.path.split(str(path))
         if all(c.isdigit() for c in last):
-            return Contest(last)
+            return Contest(last, None)
         path, first = os.path.split(str(path))
         if all(c.isdigit() for c in first) and all(c.isupper() for c in last):
-            return Problem(first, last)
+            return Problem(first, last, None)
 
         return None
 
-# class Contest:
-#     pass
+    @classmethod
+    def latest_in_dir(cls, path=work_dir):
+        dirs = [os.path.join(path, d) for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
+        latest_modified = max(dirs, key=lambda x: os.path.getmtime(x))
+        return latest_modified
 
 
-### SUBMIT
-# submit('test.cpp', '784', 'A', login('plugin_test', 'throwaway'))
-# se = Session(cookiefile='cookies.txt')
-# se = Session()
-# se.login('plugin_test', 'throwaway')
-# se.submit('test.cpp', '781', 'A')
+async def ls(args):
+    async with aiohttp.ClientSession() as session:
+        print(await Info.get_upcoming_contests(session))
 
-# prob = Problem('741', 'A')
-# print(prob.get_statement().prettify())
-# print(prob.get_test_cases())
-# cont = Contest('700')
-# for p in cont.get_problems():
-#     print(p)
-# prob = Problem('741', 'A')
-# prob.save()
-# print(Info.get_upcoming_contests())
-
-def ls(args):
-    print(Info.get_upcoming_contests())
-
-def sub(args):
+async def sub(args):
     infer = Infer.infer_dir()
     if type(infer) is Problem:
-        session = Session(cookiefile = args.c)
-        session.submit('main.cpp', infer)
+        async with Session() as session:
+            if os.path.isfile(args.c):
+                session.load(args.c)
+            await session.submit('main.cpp', infer)
+            session.save(args.c)
     else:
         print("problem couldn't be inferred from context")
 
-def login(args):
-    session = Session(cookiefile = args.c)
-    session.login(args.user, args.pasw)
+async def login(args):
+    async with Session() as session:
+        if os.path.isfile(args.c):
+            session.load(args.c)
+        await session.login(args.user, args.pasw)
+        session.save(args.c)
 
-def do(args):
-    
+async def do(args):
+    async with aiohttp.ClientSession() as session:
+        (await Contest(args.contest, session).download()).save()
+
+async def tmux(args):
+    last_contest = Infer.latest_in_dir()
+    cont = Infer.infer_dir(last_contest)
+    server = libtmux.Server()
+    name = "cf-" + cont.contest
+    session = server.find_where({'session_name': name})
+    if session == None:
+        session = server.new_session(session_name=name, detach=True)
+    else:
+        print("Error, session already found")
+
+    for d in os.listdir(last_contest):
+        w = session.new_window(attach=False, window_name=d)
+        comp = w.split_window(attach=False, vertical=False)
+        code = w.attached_pane
+        code.send_keys('cd ' + os.path.join(last_contest, d))
+        code.send_keys('vim main.cpp')
 
 parser = argparse.ArgumentParser(description='Codeforces cli tool')
 parser.add_argument('-c', default='/home/redeff/proj/pycf/cookies.txt')
@@ -321,9 +366,11 @@ parser_login.set_defaults(func=login)
 
 parser_do = subparsers.add_parser('do');
 parser_do.add_argument('contest')
-parser_do.add_argument('problem')
 parser_do.set_defaults(func=do)
 
+parser_tmux = subparsers.add_parser('tmux')
+parser_tmux.set_defaults(func=tmux)
 
 args = parser.parse_args()
-args.func(args)
+loop = asyncio.get_event_loop()
+loop.run_until_complete(args.func(args))
