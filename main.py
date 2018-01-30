@@ -13,6 +13,8 @@ import concurrent.futures
 import datetime
 import time
 import libtmux
+from subprocess import run
+import subprocess
 from colorama import init, Fore, Back, Style
 init()
 
@@ -108,6 +110,51 @@ class Session:
 # STATEMENT < statement_text, statement_images
 # STATEMENT_TEXT < @problem_page
 # STATEMENT_IMAGES < @image_page < image_url < @problem_page
+def colorcode(s):
+    output = ''
+    for c in s:
+        if c == '0':
+            output += '\033[2m0\033[0m'
+        elif c == '1':
+            output += '\033[31m1\033[0m'
+        elif c == '2':
+            output += '\033[32m2\033[0m'
+        elif c == '3':
+            output += '\033[34m3\033[0m'
+        elif c == '4':
+            output += '\033[33m4\033[0m'
+        elif c == '5':
+            output += '\033[91m5\033[0m'
+        elif c == '6':
+            output += '\033[36m6\033[0m'
+        elif c == '7':
+            output += '\033[95m7\033[0m'
+        elif c == '8':
+            output += '\033[35m8\033[0m'
+        elif c == '9':
+            output += '\033[37m9\033[0m'
+        else:
+            output += c
+    return output
+
+def indent(s, ind):
+    s = s.rstrip()
+    if s == '' or s[-1] != '\n':
+        s += '\n'
+    out = ind
+    was_n = False
+    for c in s:
+        if was_n and c != '\n':
+            out += ind
+
+        was_n = c == '\n'
+
+        out += c
+
+
+    return out
+
+
 class Problem:
 
     wrap_template = BeautifulSoup(open(html_wrap_template, 'r').read(), 'html.parser') 
@@ -332,22 +379,63 @@ async def do(args):
         (await Contest(args.contest, session).download()).save()
 
 async def tmux(args):
-    last_contest = Infer.latest_in_dir()
+    last_contest = None
+    if args.contest:
+        last_contest = os.path.join(work_dir, args.contest)
+    else:
+        last_contest = Infer.latest_in_dir()
+
     cont = Infer.infer_dir(last_contest)
     server = libtmux.Server()
     name = "cf-" + cont.contest
-    session = server.find_where({'session_name': name})
+
+    session = None
+    try:
+        session = server.find_where({'session_name': name})
+    except libtmux.exc.LibTmuxException:
+        session = None
+
     if session == None:
         session = server.new_session(session_name=name, detach=True)
     else:
-        print("Error, session already found")
+        print("Error, session already found ", session)
+        # session = server.new_session(session_name=name, detach=True)
 
     for d in os.listdir(last_contest):
         w = session.new_window(attach=False, window_name=d)
         comp = w.split_window(attach=False, vertical=False)
         code = w.attached_pane
         code.send_keys('cd ' + os.path.join(last_contest, d))
+        comp.send_keys('cd ' + os.path.join(last_contest, d))
+        comp.send_keys('cmpc main.cpp', enter=False)
         code.send_keys('vim main.cpp')
+
+async def test(args):
+    try:
+        if os.path.getmtime('main.cpp') > os.path.getmtime('prog'):
+            run(['/bin/bash', '-i', '-c', 'cmpc main.cpp -o prog'])
+    except FileNotFoundError:
+        run(['/bin/bash', '-i', '-c', 'cmpc main.cpp -o prog'])
+
+    i = 0
+
+    def wrap(s, col):
+        return indent(colorcode(s), '  \033[' + col + '|\033[0m ')
+
+    while os.path.isfile(str(i) + '.in'):
+        print('## TEST ' + str(i) + ' ##')
+        # print('\033[32m   input====\033[0m' \
+        #        + indent(colorcode(), '\033[32m')[12:])
+        print(wrap(open(str(i) + '.in').read(), '32m<'))
+        # print('\033[34m   output===\033[0m' \
+        #         + indent(colorcode(), '\033[34m')[12:])
+        print(wrap((run(['./prog', '<', str(i) + '.in'], stdout=subprocess.PIPE).stdout).decode('utf-8'), '34m>'))
+        if os.path.isfile(str(i) + '.out'):
+            # print('\033[33m   expected=\033[0m' \
+            #         + indent(colorcode(), '\033[33m')[12:])
+            print(wrap(open(str(i) + '.out').read(), '33m?'))
+
+        i += 1
 
 parser = argparse.ArgumentParser(description='Codeforces cli tool')
 parser.add_argument('-c', default='/home/redeff/proj/pycf/cookies.txt')
@@ -370,6 +458,11 @@ parser_do.set_defaults(func=do)
 
 parser_tmux = subparsers.add_parser('tmux')
 parser_tmux.set_defaults(func=tmux)
+parser_tmux.add_argument('contest', nargs='?')
+parser_tmux.add_argument('problem', nargs='?')
+
+parser_test = subparsers.add_parser('test')
+parser_test.set_defaults(func=test)
 
 args = parser.parse_args()
 loop = asyncio.get_event_loop()
