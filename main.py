@@ -351,6 +351,48 @@ class Infer:
         latest_modified = max(dirs, key=lambda x: os.path.getmtime(x))
         return latest_modified
 
+class TestResult:
+    def __init__(self, inp, loc, out, nth):
+        self.inp = inp
+        self.loc = loc
+        self.out = out
+        self.nth = nth
+
+    @classmethod
+    def wrap(cls, s, col):
+        return indent(colorcode(s), '  \033[' + col + '|\033[0m ')
+
+    def prettify(self):
+        result = ""
+        result += '## TEST ' + str(self.nth) + ' ##' + '\n'
+        result += self.wrap(self.inp, '33m<') + '\n'
+        result += self.wrap(self.loc, '34m>') + '\n'
+        if self.out:
+            result += self.wrap(self.out, '32m?') + '\n'
+
+        return result
+
+
+class Tester:
+    def __init__(self, program_name, nth):
+        input_filepath = str(nth) + '.in'
+        output_filepath = str(nth) + '.out'
+        self.program_name = program_name
+        self.input_filepath = input_filepath
+        self.output_filepath = output_filepath
+        self.nth = nth
+
+    def test(self):
+        with open(self.input_filepath, 'rb') as input_file:
+            program_output = subprocess.run([self.program_name], input = input_file.read(), stdout = subprocess.PIPE).stdout
+            correct_output = None
+            try:
+                with open(self.output_filepath) as output_file:
+                    correct_output = output_file.read()
+            except:
+                pass
+
+            return TestResult(input_file.read(), program_output.decode('utf-6'), correct_output, self.nth)
 
 async def ls(args):
     async with aiohttp.ClientSession() as session:
@@ -419,23 +461,28 @@ async def test(args):
 
     i = 0
 
-    def wrap(s, col):
-        return indent(colorcode(s), '  \033[' + col + '|\033[0m ')
-
     while os.path.isfile(str(i) + '.in'):
-        print('## TEST ' + str(i) + ' ##')
-        # print('\033[32m   input====\033[0m' \
-        #        + indent(colorcode(), '\033[32m')[12:])
-        print(wrap(open(str(i) + '.in').read(), '32m<'))
-        # print('\033[34m   output===\033[0m' \
-        #         + indent(colorcode(), '\033[34m')[12:])
-        print(wrap((run(['./prog', '<', str(i) + '.in'], stdout=subprocess.PIPE).stdout).decode('utf-8'), '34m>'))
-        if os.path.isfile(str(i) + '.out'):
-            # print('\033[33m   expected=\033[0m' \
-            #         + indent(colorcode(), '\033[33m')[12:])
-            print(wrap(open(str(i) + '.out').read(), '33m?'))
+        print(Tester('./prog', i).test().prettify())
+        # print('## TEST ' + str(i) + ' ##')
+        # # print('\033[32m   input====\033[0m' \
+        # #        + indent(colorcode(), '\033[32m')[12:])
+        # # print('\033[34m   output===\033[0m' \
+        # #         + indent(colorcode(), '\033[34m')[12:])
+        # # test_process = subprocess.Popen(['./prog'], stdin=subprocess.PIPE)
+        # # output = run(['./prog', '<', str(i) + '.in'], stdout=subprocess.PIPE).stdout
+        # # print(wrap(output.decode('utf-6'), '34m>'))
+        # with open(str(i) + '.in') as in_file:
+        #     print(wrap(in_file.read(), '33m<'))
+        #     output = subprocess.run(['./prog'], input = in_file.read(), stdout = subprocess.PIPE).stdout
+        #     print(wrap(output.decode('utf-6'), '34m>'))
+
+        # if os.path.isfile(str(i) + '.out'):
+        #     # print('\033[33m   expected=\033[0m' \
+        #     #         + indent(colorcode(), '\033[33m')[12:])
+        #     print(wrap(open(str(i) + '.out').read(), '32m?'))
 
         i += 1
+
 
 parser = argparse.ArgumentParser(description='Codeforces cli tool')
 parser.add_argument('-c', default='/home/redeff/proj/pycf/cookies.txt')
